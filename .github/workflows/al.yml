@@ -1,0 +1,93 @@
+name: Compilar AL Launcher
+
+# Se dispara al subir (o actualizar) al.zip en la raíz del repo. También a mano desde "Run workflow".
+on:
+  push:
+    paths:
+      - "al.zip"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write # necesario para borrar artifacts viejos
+
+concurrency:
+  group: al-build
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Descargar el repo
+        uses: actions/checkout@v4
+
+      - name: Descomprimir al.zip en la raíz
+        run: |
+          test -f al.zip || { echo "::error::No existe al.zip en la raíz del repo"; exit 1; }
+          unzip -q -o al.zip
+          # Si el zip trae todo dentro de una carpeta única, se sube un nivel.
+          if [ ! -f settings.gradle.kts ]; then
+            inner=$(find . -maxdepth 2 -name settings.gradle.kts -not -path "./.git/*" | head -n 1)
+            if [ -n "$inner" ]; then
+              dir=$(dirname "$inner")
+              cp -a "$dir"/. .
+            fi
+          fi
+          test -f settings.gradle.kts || { echo "::error::El zip no contiene settings.gradle.kts"; exit 1; }
+          chmod +x gradlew
+          ls -la
+
+      - name: Instalar JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Configurar Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Aceptar licencias del SDK de Android
+        run: yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+
+      - name: Tests unitarios
+        run: ./gradlew --no-daemon :app:testDebugUnitTest
+
+      - name: Compilar APK
+        run: ./gradlew --no-daemon :app:assembleRelease
+
+      - name: Subir el APK
+        id: upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: AL-Launcher-${{ github.run_number }}
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Subir reporte de tests si algo falló
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: reporte-tests-${{ github.run_number }}
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Borrar artifacts viejos
+        if: success()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          KEEP_ID: ${{ steps.upload.outputs.artifact-id }}
+        run: |
+          # Se conserva solo el artifact que se acaba de subir; el resto se elimina.
+          gh api --paginate "repos/$REPO/actions/artifacts?per_page=100" \
+            --jq '.artifacts[] | select(.id != ('"$KEEP_ID"' | tonumber)) | .id' |
+          while read -r id; do
+            [ -z "$id" ] && continue
+            echo "Borrando artifact $id"
+            gh api -X DELETE "repos/$REPO/actions/artifacts/$id" || true
+          done
